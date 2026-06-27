@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         Medium Summarizer PRO (Stylowy panel + PL translation)
 // @namespace    https://openai.com/
-// @version      4.2.0
-// @description  Summarize articles on any site; compact icon panel expands on hover. Polish translation, token/cost tracking.
+// @version      4.3.0
+// @description  Summarize articles on any site; compact icon panel expands on hover. Polish translation, token/cost tracking, Dropbox upload.
 // @match        *://*/*
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
+// @grant        GM_xmlhttpRequest
+// @connect      api.kssoft.com.pl
 // @require      https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.js
 // ==/UserScript==
 
@@ -18,7 +20,7 @@
     const scriptVersion =
       typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version
         ? GM_info.script.version
-        : "4.2.0";
+        : "4.3.0";
     console.info(`${LOG_PREFIX} userscript starting`, {
       version: scriptVersion,
       href: location.href,
@@ -78,6 +80,175 @@
       }
       GM_setValue(OPENAI_API_KEY_STORAGE_KEY, t);
       alert("Klucz zapisany.");
+    }
+
+    const PA_API_BASE_URL_KEY = "pa_api_base_url";
+    const PA_API_TOKEN_KEY = "pa_api_token";
+    const PA_API_DEFAULT_BASE_URL = "https://api.kssoft.com.pl";
+    const PA_UPLOAD_TIMEOUT_MS = 30_000;
+    const PA_UPLOAD_MAX_ATTEMPTS = 3;
+    const PA_UPLOAD_BACKOFF_MS = [1000, 2000, 4000];
+
+    function getPaApiBaseUrl() {
+      const stored = String(GM_getValue(PA_API_BASE_URL_KEY, "") || "").trim();
+      return stored || PA_API_DEFAULT_BASE_URL;
+    }
+
+    function getStoredPaApiToken() {
+      return String(GM_getValue(PA_API_TOKEN_KEY, "") || "").trim();
+    }
+
+    /** @returns {string|null} Bearer token or null if user cancelled / left empty */
+    function ensurePaApiToken() {
+      const existing = getStoredPaApiToken();
+      if (existing) return existing;
+      const raw = window.prompt(
+        [
+          "Wklej token API Personal Automation (Bearer z CLI: python -m app.cli.manage_token regenerate).",
+          "Zostanie zapisany tylko w pamięci Tampermonkey (Dashboard → ten skrypt → Values).",
+        ].join("\n\n"),
+        ""
+      );
+      if (raw === null) return null;
+      const token = raw.trim();
+      if (!token) {
+        alert("Brak tokenu — przerwano.");
+        return null;
+      }
+      GM_setValue(PA_API_TOKEN_KEY, token);
+      return token;
+    }
+
+    function openPaApiSettingsDialog() {
+      const storedToken = getStoredPaApiToken();
+      const storedBase = getPaApiBaseUrl();
+      const baseRaw = window.prompt(
+        "URL API (bez końcowego /).\nAnuluj = bez zmian.",
+        storedBase
+      );
+      if (baseRaw === null) return;
+      const base = baseRaw.trim().replace(/\/+$/, "");
+      if (base) GM_setValue(PA_API_BASE_URL_KEY, base);
+
+      const tokenRaw = window.prompt(
+        storedToken
+          ? "Wklej nowy token API aby nadpisać.\nAby usunąć zapisany token, wpisz dokładnie: USUN\n\nAnuluj = bez zmian."
+          : "Wklej token API Personal Automation.\n\nAnuluj = bez zmian.",
+        ""
+      );
+      if (tokenRaw === null) return;
+      const t = tokenRaw.trim();
+      if (t.toUpperCase() === "USUN") {
+        GM_deleteValue(PA_API_TOKEN_KEY);
+        alert("Token API usunięty z pamięci Tampermonkey.");
+        return;
+      }
+      if (!t) {
+        alert("Pusty wpis tokenu — bez zmian.");
+        return;
+      }
+      GM_setValue(PA_API_TOKEN_KEY, t);
+      alert("Ustawienia API zapisane.");
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function gmRequest(options) {
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: options.method || "GET",
+          url: options.url,
+          headers: options.headers || {},
+          data: options.data,
+          timeout: options.timeout ?? PA_UPLOAD_TIMEOUT_MS,
+          onload(response) {
+            resolve(response);
+          },
+          onerror(err) {
+            reject(new Error(err?.error || "Błąd sieci"));
+          },
+          ontimeout() {
+            reject(new Error(`Timeout po ${PA_UPLOAD_TIMEOUT_MS / 1000}s`));
+          },
+        });
+      });
+    }
+
+    function formatUploadError(response) {
+      let detail = "";
+      try {
+        const body = JSON.parse(response.responseText || "{}");
+        detail = body.detail ?? body.message ?? "";
+        if (typeof detail === "object") detail = JSON.stringify(detail);
+      } catch {
+        detail = (response.responseText || "").slice(0, 200);
+      }
+      const suffix = detail ? `: ${detail}` : "";
+      return `HTTP ${response.status}${suffix}`;
+    }
+
+    async function uploadSummaryToDropbox(payload) {
+      const token = ensurePaApiToken();
+      if (!token) throw new Error("Brak tokenu API");
+
+      const baseUrl = getPaApiBaseUrl();
+      const url = `${baseUrl}/api/summaries`;
+      let lastError = new Error("Upload nie powiódł się");
+
+      for (let attempt = 0; attempt < PA_UPLOAD_MAX_ATTEMPTS; attempt++) {
+        try {
+          const response = await gmRequest({
+            method: "POST",
+            url,
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            data: JSON.stringify(payload),
+            timeout: PA_UPLOAD_TIMEOUT_MS,
+          });
+
+          if (response.status >= 200 && response.status < 300) {
+            try {
+              return JSON.parse(response.responseText || "{}");
+            } catch {
+              return { success: true };
+            }
+          }
+
+          const errMsg = formatUploadError(response);
+          lastError = new Error(errMsg);
+          if (response.status >= 400 && response.status < 500) {
+            throw lastError;
+          }
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+        }
+
+        if (attempt < PA_UPLOAD_MAX_ATTEMPTS - 1) {
+          await sleep(PA_UPLOAD_BACKOFF_MS[attempt]);
+        }
+      }
+
+      throw lastError;
+    }
+
+    function buildSummaryUploadPayload(state) {
+      return {
+        title: state.articleTitleOriginal || state.articleTitle || "medium-article",
+        url: state.articleUrl || window.location.href,
+        source: location.hostname,
+        createdAt: new Date().toISOString(),
+        markdown: state.summaryPl || "",
+      };
+    }
+
+    function setUploadStatus(el, message, kind) {
+      if (!el) return;
+      el.textContent = message;
+      el.className = `upload-status upload-status--${kind || "info"}`;
     }
 
     const MIN_ARTICLE_CHARS = 500;
@@ -429,6 +600,45 @@
         #downloadBtn:active {
             transform: scale(0.96);
         }
+        #uploadBtn {
+            display: inline-block;
+            margin-top: 10px;
+            margin-left: 8px;
+            background: linear-gradient(135deg, #3182ce, #63b3ed);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 6px 12px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: background 0.3s ease, transform 0.1s ease;
+        }
+        #uploadBtn:hover:not(:disabled) {
+            background: linear-gradient(135deg, #2b6cb0, #4299e1);
+        }
+        #uploadBtn:active:not(:disabled) {
+            transform: scale(0.96);
+        }
+        #uploadBtn:disabled {
+            opacity: 0.65;
+            cursor: wait;
+        }
+        .upload-status {
+            margin-top: 8px;
+            font-size: 12px;
+            line-height: 1.4;
+            max-width: 100%;
+            word-break: break-word;
+        }
+        .upload-status--info {
+            color: #4a5568;
+        }
+        .upload-status--success {
+            color: #276749;
+        }
+        .upload-status--error {
+            color: #c53030;
+        }
         #summarizerPickBanner {
             position: fixed;
             left: 50%;
@@ -468,6 +678,7 @@
                   .join("")}
             </select>
             <button type="button" id="summaryPanelApiKeyBtn" class="summaryPanelBtn" style="background:linear-gradient(135deg,#4a5568,#718096);font-size:9px;padding:3px 6px;">Klucz API…</button>
+            <button type="button" id="summaryPanelPaApiBtn" class="summaryPanelBtn" style="background:linear-gradient(135deg,#2c5282,#4299e1);font-size:9px;padding:3px 6px;">Token Dropbox API…</button>
             <button type="button" id="summaryButton" class="summaryPanelBtn">summary with template</button>
             <button type="button" id="summaryButtonV2" class="summaryPanelBtn">summary (compact)</button>
             <div id="summaryPanelCustomBlock">
@@ -499,6 +710,12 @@
     btnApiKey.addEventListener("click", (e) => {
       e.stopPropagation();
       openApiKeySettingsDialog();
+    });
+
+    const btnPaApi = panel.querySelector("#summaryPanelPaApiBtn");
+    btnPaApi.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openPaApiSettingsDialog();
     });
 
     const btn = panel.querySelector("#summaryButton");
@@ -589,6 +806,77 @@
       } catch (_) {
         /* ignore */
       }
+    }
+
+    function attachSummaryExportButtons(inner, box) {
+      inner.querySelector("#summaryActions")?.remove();
+
+      const actions = document.createElement("div");
+      actions.id = "summaryActions";
+
+      const downloadBtn = document.createElement("button");
+      downloadBtn.id = "downloadBtn";
+      downloadBtn.type = "button";
+      downloadBtn.textContent = "⬇️ Download Markdown (PL)";
+      downloadBtn.onclick = () => {
+        const state = box._summarizerState;
+        const pl = state?.summaryPl;
+        if (!pl) {
+          alert("Brak streszczenia do pobrania.");
+          return;
+        }
+        const blob = new Blob([pl], { type: "text/markdown;charset=utf-8" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        const date = new Date().toISOString().replaceAll(/[:.]/g, "-");
+        const slug = state?.articleTitle || "medium-article";
+        const model = select.value;
+        link.download = `${slug}_summary_pl_${model}_${date}.md`;
+        link.click();
+      };
+
+      const uploadBtn = document.createElement("button");
+      uploadBtn.id = "uploadBtn";
+      uploadBtn.type = "button";
+      uploadBtn.textContent = "☁️ Wyślij do Dropbox";
+      const uploadStatus = document.createElement("div");
+      uploadStatus.id = "uploadStatus";
+      uploadStatus.className = "upload-status upload-status--info";
+      uploadStatus.setAttribute("aria-live", "polite");
+
+      uploadBtn.onclick = async () => {
+        const state = box._summarizerState;
+        if (!state?.summaryPl) {
+          alert("Brak streszczenia do wysłania.");
+          return;
+        }
+        const payload = buildSummaryUploadPayload(state);
+        if (!payload.markdown.trim()) {
+          alert("Streszczenie jest puste.");
+          return;
+        }
+
+        uploadBtn.disabled = true;
+        setUploadStatus(uploadStatus, "Wysyłanie do Dropbox…", "info");
+
+        try {
+          const result = await uploadSummaryToDropbox(payload);
+          const filename = result.filename || result.dropbox_path || "plik";
+          setUploadStatus(uploadStatus, `✅ Zapisano: ${filename}`, "success");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setUploadStatus(uploadStatus, `❌ ${msg}`, "error");
+          console.error(`${LOG_PREFIX} Dropbox upload failed`, err);
+        } finally {
+          uploadBtn.disabled = false;
+        }
+      };
+
+      actions.appendChild(document.createElement("br"));
+      actions.appendChild(downloadBtn);
+      actions.appendChild(uploadBtn);
+      actions.appendChild(uploadStatus);
+      inner.appendChild(actions);
     }
 
     function buildRefineUserContent(instruction, articleText, existingSummaryPl) {
@@ -988,8 +1276,9 @@
       console.log(`Summarizer: article text via "${extraction.method}" (${articleText.length} chars)`);
 
       // 🔖 Pobranie tytułu artykułu
-      let articleTitle = document.querySelector("h1")?.innerText || "medium-article";
-      articleTitle = articleTitle
+      const articleTitleOriginal =
+        document.querySelector("h1")?.innerText?.trim() || "medium-article";
+      const articleTitle = articleTitleOriginal
         .toLowerCase()
         .replaceAll(/[^a-z0-9\s\-]/g, "")
         .trim()
@@ -1081,26 +1370,12 @@
           summaryPl: translated,
           articleUrl,
           articleTitle,
+          articleTitleOriginal,
         };
         const inner = getSummaryBoxInner(box);
         inner.replaceChildren();
         updateSummaryBodyDisplay(box, translated);
-
-        // 💾 Pobierz Markdown
-        const downloadBtn = document.createElement("button");
-        downloadBtn.id = "downloadBtn";
-        downloadBtn.textContent = "⬇️ Download Markdown (PL)";
-        downloadBtn.onclick = () => {
-          const pl = box._summarizerState?.summaryPl ?? translated;
-          const blob = new Blob([pl], { type: "text/markdown;charset=utf-8" });
-          const link = document.createElement("a");
-          link.href = URL.createObjectURL(blob);
-          const date = new Date().toISOString().replaceAll(/[:.]/g, "-");
-          link.download = `${articleTitle}_summary_pl_${model}_${date}.md`;
-          link.click();
-        };
-        inner.appendChild(document.createElement("br"));
-        inner.appendChild(downloadBtn);
+        attachSummaryExportButtons(inner, box);
       } catch (err) {
         alert("❌ Błąd: " + err.message);
         console.error(err);
